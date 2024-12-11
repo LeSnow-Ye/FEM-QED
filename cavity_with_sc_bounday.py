@@ -22,6 +22,7 @@ scalar_type = PETSc.ScalarType
 import ufl
 from basix.ufl import element
 from dolfinx import fem, io, plot
+from dolfinx.io import gmshio
 from dolfinx.fem.petsc import assemble_matrix
 from dolfinx.mesh import (
     CellType,
@@ -40,199 +41,254 @@ except ModuleNotFoundError:
     print("pyvista and pyvistaqt are required to visualise the solution")
     have_pyvista = False
 
-# Parameters
 
-lx = 1.0
-ly = 1.0
-sc = 0.5
+def solve(
+    mesh,
+    inv_lambda_sqr: fem.Function,
+    fem_degree=2,
+    gui=False,
+    eps_target=15.0,
+    num_eigs=13,
+    tol=1e-10,
+):
+    print(f"Assembling matrices...")
+
+    N1curl = element("N1curl", mesh.basix_cell(), fem_degree, dtype=real_type)
+    V = fem.functionspace(mesh, N1curl)
+
+    e = ufl.TrialFunction(V)
+    w = ufl.TestFunction(V)
+
+    a_weak = (
+        ufl.inner(ufl.curl(e), ufl.curl(w)) + inv_lambda_sqr * ufl.inner(e, w)
+    ) * ufl.dx
+
+    b_weak = (ufl.inner(e, w)) * ufl.dx
+
+    a = fem.form(a_weak)
+    b = fem.form(b_weak)
+
+    # Direchlet boundary conditions
+
+    bc_facets = exterior_facet_indices(mesh.topology)
+    bc_dofs = fem.locate_dofs_topological(V, mesh.topology.dim - 1, bc_facets)
+    u_bc = fem.Function(V)
+    with u_bc.x.petsc_vec.localForm() as loc:
+        loc.set(0)
+    bc = fem.dirichletbc(u_bc, bc_dofs)
+
+    # Assemble matrices for eigenvalue problem
+    # Ax = lambda B x
+
+    A = assemble_matrix(a, bcs=[bc])
+    A.assemble()
+    B = assemble_matrix(b, bcs=[bc], diagonal=0.0)
+    B.assemble()
+
+    # Create SLEPc Eigenvalue solver
+    print(f"Solving eigenvalues...")
+    eps = SLEPc.EPS().create(mesh.comm)
+    eps.setOperators(A, B)
+    eps.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+    eps.setProblemType(SLEPc.EPS.ProblemType.GHEP)
+    eps.setWhichEigenpairs(eps.Which.TARGET_MAGNITUDE)
+    eps.setTarget(eps_target)
+
+    # Set shift-and-invert transformation
+    st = eps.getST()
+    st.setType(SLEPc.ST.Type.SINVERT)
+    st.setShift(eps_target)
+
+    def monitor(eps, its, nconv, eig, err):
+        print(f"Iteration: {its}, Error: {err[nconv]}")
+
+    eps.setMonitor(monitor)
+
+    eps.setDimensions(num_eigs, PETSc.DECIDE, PETSc.DECIDE)
+    eps.setFromOptions()
+    eps.setTolerances(tol=tol)
+    eps.solve()
+    eps.view()
+    eps.errorView()
+
+    its = eps.getIterationNumber()
+    eps_type = eps.getType()
+    n_ev, n_cv, mpd = eps.getDimensions()
+    tol, max_it = eps.getTolerances()
+    n_conv = eps.getConverged()
+
+    print("##################################")
+    print(f"Number of iterations: {its}")
+    print(f"Solution method: {eps_type}")
+    print(f"Number of requested eigenvalues: {n_ev}")
+    print(f"Stopping condition: tol={tol}, maxit={max_it}")
+    print(f"Number of converged eigenpairs: {n_conv}")
+    print("##################################\n")
+
+    vals = [(i, eps.getEigenvalue(i)) for i in range(eps.getConverged())]
+    vals.sort(key=lambda x: x[1].real)
+
+    eig_list = []
+    field_B = fem.Function(V)
+
+    if os.path.exists(f"results/lambda_{lambda_l}"):
+        print(
+            f"Warning:Folder results/lambda_{lambda_l} already exists. Removing it..."
+        )
+        for root, dirs, files in os.walk(f"results/lambda_{lambda_l}", topdown=False):
+            for name in files:
+                os.remove(os.path.join(root, name))
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
+    else:
+        os.makedirs(f"results/lambda_{lambda_l}", exist_ok=True)
+
+    for i, eig in vals:
+        # Save eigenvector in field_B
+        eps.getEigenpair(i, field_B.x.petsc_vec)
+
+        error = eps.computeError(i, SLEPc.EPS.ErrorType.RELATIVE)
+        if error >= tol:  # and np.isclose(eig.imag, 0, atol=tol):
+            continue
+
+        eig_list.append(eig)
+
+        # TODO: Comparing with analytical modes when λ_L is zero.
+
+        eig_str = f"#{i} Eigenvalue: {eig.real}\t L√E/π: {np.sqrt(eig.real)/np.pi}"
+        print(eig_str)
+        with open(f"results/lambda_{lambda_l}/eigs.txt", "a") as f:
+            f.write(eig_str + "\n")
+
+        field_B.x.scatter_forward()
+
+        gdim = mesh.geometry.dim
+        V_dg = fem.functionspace(mesh, ("DG", fem_degree, (gdim,)))
+        B_dg = fem.Function(V_dg)
+
+        B_dg.interpolate(field_B)
+
+        # Save solutions
+        with io.VTXWriter(
+            mesh.comm, f"results/lambda_{lambda_l}/sols/B_{i}.bp", B_dg
+        ) as f:
+            f.write(0.0)
+
+        # Visualize solutions with Pyvista
+        if have_pyvista:
+            V_cells, V_types, V_x = plot.vtk_mesh(V_dg)
+            V_grid = pyvista.UnstructuredGrid(V_cells, V_types, V_x)
+
+            B_vectors = B_dg.x.array.reshape(V_x.shape[0], mesh.topology.dim).real
+            B_values = np.linalg.norm(B_vectors, axis=1)
+
+            V_grid.point_data["b"] = B_values
+            # B_max = np.max(B_values)
+            V_grid.set_active_scalars("b")
+            warped = V_grid.warp_by_scalar("b", factor=0.3)
+
+            plotter = pyvista.Plotter(off_screen=not gui)
+            plotter.add_mesh(warped, show_edges=False, cmap="twilight")
+            # plotter.add_mesh(V_grid.copy(), show_edges=False)
+            plotter.add_text(
+                f"L√E/π: {np.sqrt(eig.real)/np.pi}",
+                position="upper_left",
+            )
+
+            # plotter.view_xy()
+            # plotter.link_views()
+
+            plotter.save_graphic(
+                f"results/lambda_{lambda_l}/eig_{np.sqrt(eig.real)/np.pi:.3f}_i{i}.svg"
+            )
+
+            if not pyvista.OFF_SCREEN:
+                plotter.show()
+
+    eps.destroy()
+
+
+# Parameters
 lambda_l = 0.03
-cell_size = 0.01
-fem_degree = 2
 gui = True
 
-# Mesh
+use_gmsh = True
 
-nx = int((lx + 2 * sc) / cell_size)
-ny = int((ly + 2 * sc) / cell_size)
-print(f"Number of cells: {nx} x {ny}")
+if use_gmsh:
+    # Using Gmsh.
+    Cavity = 1
+    SC_boundary = 2
 
-msh = create_rectangle(
-    MPI.COMM_WORLD,
-    np.array([[-sc, -sc], [lx + sc, ly + sc]]),
-    np.array([nx, ny]),
-    CellType.quadrilateral,
-)
-msh.topology.create_connectivity(msh.topology.dim - 1, msh.topology.dim)
+    mesh, cell_markers, facet_markers = gmshio.read_from_msh(
+        "mesh/square_sc_boundary.msh", MPI.COMM_WORLD, gdim=2
+    )
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
 
-print(f"msh.topology.dim: {msh.topology.dim}")
+    D = fem.functionspace(mesh, ("DG", 0))
+    num_dofs = D.dofmap.index_map.size_local + D.dofmap.index_map.num_ghosts
+    print(f"Number of DOFs: {num_dofs}")
 
-# 1/lambda^2
+    inv_lambda_sqr = fem.Function(D)
+    ils = 1 / lambda_l**2
 
+    material_tags = np.unique(cell_markers.values)
+    print(f"Material tags: {material_tags}")
 
-def at_sc_boundary(pos):
-    return pos[0] <= 0 or pos[0] >= lx or pos[1] <= 0 or pos[1] >= ly
+    for tag in material_tags:
+        cells = cell_markers.find(tag)
+        # Set values for inv lambda^2
+        if tag == SC_boundary:
+            inv_lambda_sqr.x.array[cells] = np.full_like(cells, ils, dtype=scalar_type)
+        elif tag == Cavity:
+            inv_lambda_sqr.x.array[cells] = np.full_like(cells, 0, dtype=scalar_type)
 
+else:
+    # Using FEniCS buid-in mesh generator.
+    lx = 1.0
+    ly = 1.0
+    sc = 0.5
+    cell_size = 0.01
 
-def SC(x):
-    return np.array([at_sc_boundary(pos) for pos in x.T], dtype=bool)
+    # Mesh
 
+    nx = int((lx + 2 * sc) / cell_size)
+    ny = int((ly + 2 * sc) / cell_size)
+    print(f"Number of cells: {nx} x {ny}")
 
-def cavity(pos_list):
-    return np.logical_not(SC(pos_list))
+    mesh = create_rectangle(
+        MPI.COMM_WORLD,
+        np.array([[-sc, -sc], [lx + sc, ly + sc]]),
+        np.array([nx, ny]),
+        CellType.quadrilateral,
+    )
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
 
+    print(f"msh.topology.dim: {mesh.topology.dim}")
 
-D = fem.functionspace(msh, ("DG", 0))
-inv_lambda_sqr = fem.Function(D)
+    # 1/lambda^2
 
-cells_scb = locate_entities(msh, msh.topology.dim, SC)
-cells_cavity = locate_entities(msh, msh.topology.dim, cavity)
+    def at_sc_boundary(pos):
+        return pos[0] <= 0 or pos[0] >= lx or pos[1] <= 0 or pos[1] >= ly
 
-ils = 1 / lambda_l**2
-inv_lambda_sqr.x.array[cells_scb] = np.full_like(cells_scb, ils, dtype=scalar_type)
-inv_lambda_sqr.x.array[cells_cavity] = np.full_like(cells_cavity, 0, dtype=scalar_type)
+    def sc(x):
+        return np.array([at_sc_boundary(pos) for pos in x.T], dtype=bool)
 
-# FEM
+    def cavity(pos_list):
+        return np.logical_not(sc(pos_list))
 
-N1curl = element("N1curl", msh.basix_cell(), fem_degree, dtype=real_type)
-V = fem.functionspace(msh, N1curl)
+    D = fem.functionspace(mesh, ("DG", 0))
+    num_dofs = D.dofmap.index_map.size_local + D.dofmap.index_map.num_ghosts
+    print(f"Number of DOFs: {num_dofs}")
 
-e = ufl.TrialFunction(V)
-w = ufl.TestFunction(V)
+    inv_lambda_sqr = fem.Function(D)
 
-a_weak = (
-    ufl.inner(ufl.curl(e), ufl.curl(w)) + inv_lambda_sqr * ufl.inner(e, w)
-) * ufl.dx
+    cells_scb = locate_entities(mesh, mesh.topology.dim, sc)
+    cells_cavity = locate_entities(mesh, mesh.topology.dim, cavity)
 
-b_weak = (ufl.inner(e, w)) * ufl.dx
+    ils = 1 / lambda_l**2
+    inv_lambda_sqr.x.array[cells_scb] = np.full_like(cells_scb, ils, dtype=scalar_type)
+    inv_lambda_sqr.x.array[cells_cavity] = np.full_like(
+        cells_cavity, 0, dtype=scalar_type
+    )
 
-a = fem.form(a_weak)
-b = fem.form(b_weak)
-
-# Direchlet boundary conditions
-
-bc_facets = exterior_facet_indices(msh.topology)
-bc_dofs = fem.locate_dofs_topological(V, msh.topology.dim - 1, bc_facets)
-u_bc = fem.Function(V)
-with u_bc.x.petsc_vec.localForm() as loc:
-    loc.set(0)
-bc = fem.dirichletbc(u_bc, bc_dofs)
-
-# Assemble matrices for eigenvalue problem
-# Ax = lambda B x
-
-A = assemble_matrix(a, bcs=[bc])
-A.assemble()
-B = assemble_matrix(b, bcs=[bc], diagonal=0.0)
-B.assemble()
-
-# Create SLEPc Eigenvalue solver
-eps_target = 15.0
-num_eigs = 13
-
-eps = SLEPc.EPS().create(msh.comm)
-eps.setOperators(A, B)
-eps.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
-eps.setProblemType(SLEPc.EPS.ProblemType.GHEP)
-eps.setWhichEigenpairs(eps.Which.TARGET_MAGNITUDE)
-eps.setTarget(eps_target)
-
-# Set shift-and-invert transformation
-st = eps.getST()
-st.setType(SLEPc.ST.Type.SINVERT)
-st.setShift(eps_target)
-
-
-def monitor(eps, its, nconv, eig, err):
-    print(f"Iteration: {its}, Error: {err[nconv]}")
-
-
-eps.setMonitor(monitor)
-
-eps.setDimensions(num_eigs, PETSc.DECIDE, PETSc.DECIDE)
-eps.setFromOptions()
-eps.setTolerances(tol=1e-10)
-eps.solve()
-eps.view()
-eps.errorView()
-
-its = eps.getIterationNumber()
-eps_type = eps.getType()
-n_ev, n_cv, mpd = eps.getDimensions()
-tol, max_it = eps.getTolerances()
-n_conv = eps.getConverged()
-
-print("##################################")
-print(f"Number of iterations: {its}")
-print(f"Solution method: {eps_type}")
-print(f"Number of requested eigenvalues: {n_ev}")
-print(f"Stopping condition: tol={tol}, maxit={max_it}")
-print(f"Number of converged eigenpairs: {n_conv}")
-print("##################################\n")
-
-vals = [(i, eps.getEigenvalue(i)) for i in range(eps.getConverged())]
-vals.sort(key=lambda x: x[1].real)
-
-eig_list = []
-os.makedirs(f"results/lambda_{lambda_l}", exist_ok=True)
-field_B = fem.Function(V)
-for i, eig in vals:
-    # Save eigenvector in field_B
-    eps.getEigenpair(i, field_B.x.petsc_vec)
-
-    error = eps.computeError(i, SLEPc.EPS.ErrorType.RELATIVE)
-    if error >= tol:  # and np.isclose(eig.imag, 0, atol=tol):
-        continue
-
-    eig_list.append(eig)
-
-    # TODO: Comparing with analytical modes when λ_L is zero.
-
-    eig_str = f"#{i} Eigenvalue: {eig.real}\t L√E/π: {np.sqrt(eig.real)/np.pi}"
-    print(eig_str)
-    with open(f"results/lambda_{lambda_l}/eigs.txt", "a") as f:
-        f.write(eig_str + "\n")
-
-    field_B.x.scatter_forward()
-
-    gdim = msh.geometry.dim
-    V_dg = fem.functionspace(msh, ("DG", fem_degree, (gdim,)))
-    B_dg = fem.Function(V_dg)
-
-    B_dg.interpolate(field_B)
-
-    # Save solutions
-    with io.VTXWriter(msh.comm, f"results/lambda_{lambda_l}/sols/B_{i}.bp", B_dg) as f:
-        f.write(0.0)
-
-    # Visualize solutions with Pyvista
-    if have_pyvista:
-        V_cells, V_types, V_x = plot.vtk_mesh(V_dg)
-        V_grid = pyvista.UnstructuredGrid(V_cells, V_types, V_x)
-
-        B_vectors = B_dg.x.array.reshape(V_x.shape[0], msh.topology.dim).real
-        B_values = np.linalg.norm(B_vectors, axis=1)
-
-        V_grid.point_data["b"] = B_values
-        # B_max = np.max(B_values)
-        V_grid.set_active_scalars("b")
-        warped = V_grid.warp_by_scalar("b", factor=0.3)
-
-        plotter = pyvista.Plotter(off_screen=not gui)
-        plotter.add_mesh(warped, show_edges=False, cmap="twilight")
-        # plotter.add_mesh(V_grid.copy(), show_edges=False)
-        plotter.add_text(
-            f"L√E/π: {np.sqrt(eig.real)/np.pi}",
-            position="upper_left",
-        )
-
-        # plotter.view_xy()
-        # plotter.link_views()
-
-        plotter.save_graphic(
-            f"results/lambda_{lambda_l}/eig_{np.sqrt(eig.real)/np.pi:.3f}_i{i}.svg"
-        )
-
-        if not pyvista.OFF_SCREEN:
-            plotter.show()
-
-eps.destroy()
+solve(mesh, inv_lambda_sqr, fem_degree=3, gui=gui)
