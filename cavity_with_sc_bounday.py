@@ -5,6 +5,7 @@ import numpy as np
 from mpi4py import MPI
 from petsc4py import PETSc
 import dolfinx
+import argparse
 
 assert dolfinx.has_petsc
 
@@ -50,20 +51,22 @@ def solve(
     eps_target=15.0,
     num_eigs=13,
     tol=1e-10,
+    output_path="results",
 ):
     print(f"Assembling matrices...")
 
     N1curl = element("N1curl", mesh.basix_cell(), fem_degree, dtype=real_type)
     V = fem.functionspace(mesh, N1curl)
 
-    e = ufl.TrialFunction(V)
-    w = ufl.TestFunction(V)
+    b_func = ufl.TrialFunction(V)
+    w_func = ufl.TestFunction(V)
 
     a_weak = (
-        ufl.inner(ufl.curl(e), ufl.curl(w)) + inv_lambda_sqr * ufl.inner(e, w)
+        ufl.inner(ufl.curl(b_func), ufl.curl(w_func))
+        + inv_lambda_sqr * ufl.inner(b_func, w_func)
     ) * ufl.dx
 
-    b_weak = (ufl.inner(e, w)) * ufl.dx
+    b_weak = (ufl.inner(b_func, w_func)) * ufl.dx
 
     a = fem.form(a_weak)
     b = fem.form(b_weak)
@@ -86,6 +89,14 @@ def solve(
     B.assemble()
 
     # Create SLEPc Eigenvalue solver
+
+    # TODO: Check parameters for SLEPc of Palace:
+    # Configuring SLEPc eigenvalue solver:
+    # Scaling γ = 3.036e+04, δ = 5.892e-05
+    # Configuring divergence-free projection
+    # Using random starting vector
+    # Shift-and-invert σ = 5.000e+00 GHz (3.144e-01)
+
     print(f"Solving eigenvalues...")
     eps = SLEPc.EPS().create(mesh.comm)
     eps.setOperators(A, B)
@@ -131,17 +142,19 @@ def solve(
     eig_list = []
     field_B = fem.Function(V)
 
-    if os.path.exists(f"results/lambda_{lambda_l}"):
+    if os.path.exists(f"{output_path}/lambda_{lambda_l}"):
         print(
-            f"Warning:Folder results/lambda_{lambda_l} already exists. Removing it..."
+            f"Warning:Folder {output_path}/lambda_{lambda_l} already exists. Removing it..."
         )
-        for root, dirs, files in os.walk(f"results/lambda_{lambda_l}", topdown=False):
+        for root, dirs, files in os.walk(
+            f"{output_path}/lambda_{lambda_l}", topdown=False
+        ):
             for name in files:
                 os.remove(os.path.join(root, name))
             for name in dirs:
                 os.rmdir(os.path.join(root, name))
     else:
-        os.makedirs(f"results/lambda_{lambda_l}", exist_ok=True)
+        os.makedirs(f"{output_path}/lambda_{lambda_l}", exist_ok=True)
 
     for i, eig in vals:
         # Save eigenvector in field_B
@@ -149,6 +162,10 @@ def solve(
 
         error = eps.computeError(i, SLEPc.EPS.ErrorType.RELATIVE)
         if error >= tol:  # and np.isclose(eig.imag, 0, atol=tol):
+            print(
+                f"Warning: The error {error} of eigenvalue {eig.real} is greater than tolerance {tol}. Neglecting it."
+            )
+
             continue
 
         eig_list.append(eig)
@@ -157,7 +174,7 @@ def solve(
 
         eig_str = f"#{i} Eigenvalue: {eig.real}\t L√E/π: {np.sqrt(eig.real)/np.pi}"
         print(eig_str)
-        with open(f"results/lambda_{lambda_l}/eigs.txt", "a") as f:
+        with open(f"{output_path}/lambda_{lambda_l}/eigs.txt", "a") as f:
             f.write(eig_str + "\n")
 
         field_B.x.scatter_forward()
@@ -170,7 +187,7 @@ def solve(
 
         # Save solutions
         with io.VTXWriter(
-            mesh.comm, f"results/lambda_{lambda_l}/sols/B_{i}.bp", B_dg
+            mesh.comm, f"{output_path}/lambda_{lambda_l}/sols/B_{i}.bp", B_dg
         ) as f:
             f.write(0.0)
 
@@ -182,6 +199,7 @@ def solve(
             B_vectors = B_dg.x.array.reshape(V_x.shape[0], mesh.topology.dim).real
             B_values = np.linalg.norm(B_vectors, axis=1)
 
+            # V_grid.point_data["b"] = B_vectors[:, 0]
             V_grid.point_data["b"] = B_values
             # B_max = np.max(B_values)
             V_grid.set_active_scalars("b")
@@ -189,7 +207,7 @@ def solve(
 
             plotter = pyvista.Plotter(off_screen=not gui)
             plotter.add_mesh(warped, show_edges=False, cmap="twilight")
-            # plotter.add_mesh(V_grid.copy(), show_edges=False)
+            # plotter.add_mesh(V_grid.copy(), show_edges=False, cmap="twilight")
             plotter.add_text(
                 f"L√E/π: {np.sqrt(eig.real)/np.pi}",
                 position="upper_left",
@@ -199,7 +217,7 @@ def solve(
             # plotter.link_views()
 
             plotter.save_graphic(
-                f"results/lambda_{lambda_l}/eig_{np.sqrt(eig.real)/np.pi:.3f}_i{i}.svg"
+                f"{output_path}/lambda_{lambda_l}/eig_{np.sqrt(eig.real)/np.pi:.3f}_i{i}.svg"
             )
 
             if not pyvista.OFF_SCREEN:
@@ -208,19 +226,13 @@ def solve(
     eps.destroy()
 
 
-# Parameters
-lambda_l = 0.03
-gui = True
-
-use_gmsh = True
-
-if use_gmsh:
+def load_gmsh_mesh(mesh_path):
     # Using Gmsh.
     Cavity = 1
     SC_boundary = 2
 
     mesh, cell_markers, facet_markers = gmshio.read_from_msh(
-        "mesh/square_sc_boundary.msh", MPI.COMM_WORLD, gdim=2
+        mesh_path, MPI.COMM_WORLD, gdim=2
     )
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
 
@@ -242,7 +254,10 @@ if use_gmsh:
         elif tag == Cavity:
             inv_lambda_sqr.x.array[cells] = np.full_like(cells, 0, dtype=scalar_type)
 
-else:
+    return mesh, inv_lambda_sqr
+
+
+def generate_mesh():
     # Using FEniCS buid-in mesh generator.
     lx = 1.0
     ly = 1.0
@@ -291,4 +306,69 @@ else:
         cells_cavity, 0, dtype=scalar_type
     )
 
-solve(mesh, inv_lambda_sqr, fem_degree=3, gui=gui)
+    return mesh, inv_lambda_sqr
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Solve Maxwell eigenvalue problem for a cavity with superconducting boundary conditions."
+    )
+    parser.add_argument(
+        "-l", "--lambda_l", type=float, default=0.01, help="Lambda parameter"
+    )
+    parser.add_argument(
+        "-msh",
+        "--mesh_path",
+        type=str,
+        help="GMSH format mesh file path. If not set, use built-in mesh generator.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output_path",
+        type=str,
+        default="results",
+        help="Output path for results",
+    )
+    parser.add_argument(
+        "-n",
+        "--num_eigs",
+        type=int,
+        default=13,
+        help="Number of eigenvalues to compute",
+    )
+    parser.add_argument("--gui", action="store_true", help="Enable GUI")
+    parser.add_argument(
+        "--eps_target", type=float, default=15.0, help="Target eigenvalue for SLEPc"
+    )
+    parser.add_argument(
+        "--tol", type=float, default=1e-10, help="Tolerance for eigenvalue solver"
+    )
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_arguments()
+    lambda_l = args.lambda_l
+    gui = args.gui
+    eps_target = args.eps_target
+    num_eigs = args.num_eigs
+    tol = args.tol
+    output_path = args.output_path
+    mesh_path = args.mesh_path
+
+    if mesh_path:
+        mesh, inv_lambda_sqr = load_gmsh_mesh(mesh_path)
+    else:
+        mesh, inv_lambda_sqr = generate_mesh()
+
+    solve(
+        mesh,
+        inv_lambda_sqr,
+        fem_degree=3,
+        gui=gui,
+        eps_target=eps_target,
+        num_eigs=num_eigs,
+        tol=tol,
+        output_path=output_path,
+    )
