@@ -46,12 +46,17 @@ except ModuleNotFoundError:
 def solve(
     mesh,
     inv_lambda_sqr: fem.Function,
+    lambda_l,
     fem_degree=2,
     gui=False,
     eps_target=15.0,
     num_eigs=13,
     tol=1e-10,
+    max_it=100,
     output_path="results",
+    plot_mode="3D",
+    plot_z_factor=0.3,
+    clean_plot=False,
 ):
     print(f"Assembling matrices...")
 
@@ -117,7 +122,7 @@ def solve(
 
     eps.setDimensions(num_eigs, PETSc.DECIDE, PETSc.DECIDE)
     eps.setFromOptions()
-    eps.setTolerances(tol=tol)
+    eps.setTolerances(tol=tol, max_it=max_it)
     eps.solve()
     eps.view()
     eps.errorView()
@@ -199,22 +204,25 @@ def solve(
             B_vectors = B_dg.x.array.reshape(V_x.shape[0], mesh.topology.dim).real
             B_values = np.linalg.norm(B_vectors, axis=1)
 
-            # V_grid.point_data["b"] = B_vectors[:, 0]
             V_grid.point_data["b"] = B_values
-            # B_max = np.max(B_values)
             V_grid.set_active_scalars("b")
-            warped = V_grid.warp_by_scalar("b", factor=0.3)
 
             plotter = pyvista.Plotter(off_screen=not gui)
-            plotter.add_mesh(warped, show_edges=False, cmap="twilight")
-            # plotter.add_mesh(V_grid.copy(), show_edges=False, cmap="twilight")
-            plotter.add_text(
-                f"L√E/π: {np.sqrt(eig.real)/np.pi}",
-                position="upper_left",
-            )
+            if plot_mode == "3D":
+                warped = V_grid.warp_by_scalar("b", factor=plot_z_factor)
+                plotter.add_mesh(warped, show_edges=False, cmap="twilight")
+            elif plot_mode == "2D":
+                plotter.add_mesh(V_grid, show_edges=False, cmap="twilight")
+                plotter.view_xy()
 
-            # plotter.view_xy()
-            # plotter.link_views()
+            if clean_plot:
+                plotter.remove_legend()
+                plotter.remove_scalar_bar()
+            else:
+                plotter.add_text(
+                    f"λ_L={lambda_l}   L√E/π={np.sqrt(eig.real)/np.pi:.4f}",
+                    position="upper_left",
+                )
 
             plotter.save_graphic(
                 f"{output_path}/lambda_{lambda_l}/eig_{np.sqrt(eig.real)/np.pi:.3f}_i{i}.svg"
@@ -343,6 +351,22 @@ def parse_arguments():
     parser.add_argument(
         "--tol", type=float, default=1e-10, help="Tolerance for eigenvalue solver"
     )
+    parser.add_argument(
+        "--max_it", type=int, default=100, help="Maximum number of iterations"
+    )
+    parser.add_argument(
+        "--plot_mode",
+        type=str,
+        default="3D",
+        choices=["2D", "3D"],
+        help="Plotting mode",
+    )
+    parser.add_argument(
+        "--plot_z_factor", type=float, default=0.3, help="Factor for 3D warping"
+    )
+    parser.add_argument(
+        "--clean_plot", action="store_true", help="Remove legend and text from plot"
+    )
 
     return parser.parse_args()
 
@@ -354,8 +378,12 @@ if __name__ == "__main__":
     eps_target = args.eps_target
     num_eigs = args.num_eigs
     tol = args.tol
+    max_it = args.max_it
     output_path = args.output_path
     mesh_path = args.mesh_path
+    plot_mode = args.plot_mode
+    plot_z_factor = args.plot_z_factor
+    clean_plot = args.clean_plot
 
     if mesh_path:
         mesh, inv_lambda_sqr = load_gmsh_mesh(mesh_path)
@@ -365,10 +393,15 @@ if __name__ == "__main__":
     solve(
         mesh,
         inv_lambda_sqr,
+        lambda_l=lambda_l,
         fem_degree=3,
         gui=gui,
         eps_target=eps_target,
         num_eigs=num_eigs,
         tol=tol,
+        max_it=max_it,
         output_path=output_path,
+        plot_mode=plot_mode,
+        plot_z_factor=plot_z_factor,
+        clean_plot=clean_plot,
     )
