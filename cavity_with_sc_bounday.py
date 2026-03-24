@@ -23,7 +23,7 @@ scalar_type = PETSc.ScalarType
 import ufl
 from basix.ufl import element
 from dolfinx import fem, io, plot
-from dolfinx.io import gmshio
+from dolfinx.io import gmsh
 from dolfinx.fem.petsc import assemble_matrix
 from dolfinx.mesh import (
     CellType,
@@ -90,7 +90,7 @@ def solve(
 
     A = assemble_matrix(a, bcs=[bc])
     A.assemble()
-    B = assemble_matrix(b, bcs=[bc], diagonal=0.0)
+    B = assemble_matrix(b, bcs=[bc], diag=0.0)
     B.assemble()
 
     # Create SLEPc Eigenvalue solver
@@ -239,7 +239,7 @@ def load_gmsh_mesh(mesh_path):
     Cavity = 1
     SC_boundary = 2
 
-    mesh, cell_markers, facet_markers = gmshio.read_from_msh(
+    mesh, cell_markers, facet_markers = gmsh.read_from_msh(
         mesh_path, MPI.COMM_WORLD, gdim=2
     )
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)

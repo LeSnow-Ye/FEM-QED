@@ -167,5 +167,5 @@ def generate_disk_mesh(
 
 if __name__ == "__main__":
     # generate_square_mesh(1.0, 1.0, 10, 10)
-    # generate_square_mesh(1.0, 1.0, 0.005, 0.05, 0.5, "square_sc_boundary.msh", True)
-    generate_disk_mesh(1.0, 0.01, 0.05, 0.5, "disk_sc_boundary.msh", True)
+    generate_square_mesh(1.0, 1.0, 0.005, 0.05, 0.5, "square_sc_boundary.msh", True)
+    # generate_disk_mesh(1.0, 0.01, 0.05, 0.5, "disk_sc_boundary.msh", True)
